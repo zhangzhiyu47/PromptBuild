@@ -1,0 +1,9 @@
+[package]
+name = "prompt"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+unicode-width = "0.1"
+terminal_size = "0.4"
+nix = { version = "0.27", features = ["user", "signal", "hostname"] }
