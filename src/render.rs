@@ -2,17 +2,6 @@
 
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-/// Color constants.
-const RESET: &str = "\x1b[0m";
-const BORDER_ROOT: &str = "\x1b[34m"; // Blue
-const BORDER_USER: &str = "\x1b[32m"; // Green
-const USER_ROOT: &str = "\x1b[1;31m"; // Red
-const USER_NORMAL: &str = "\x1b[1;34m"; // Blue
-
-/// User permission identifier
-const PROMPT_ROOT: &str = "#";
-const PROMPT_USER: &str = "$";
-
 /// Border
 const LINK: &str = "─";
 
@@ -21,8 +10,7 @@ const LINK: &str = "─";
 pub enum Frame {
     Paren,
     Bracket,
-    #[allow(dead_code)]
-    None,
+    //None,
 }
 
 impl Frame {
@@ -30,7 +18,7 @@ impl Frame {
         match self {
             Frame::Paren => Some(('(', ')')),
             Frame::Bracket => Some(('[', ']')),
-            Frame::None => None,
+            //Frame::None => None,
         }
     }
 }
@@ -40,23 +28,25 @@ impl Frame {
 pub enum Color {
     Reset,
     BoldRed,
-    #[allow(dead_code)]
-    Green,
-    #[allow(dead_code)]
-    Blue,
     BoldBlue,
     Yellow,
     /// Follow the border colour chosen by `render_prompt`.
     Border,
 }
 
+fn is_no_color() -> bool {
+    std::env::var_os("NO_COLOR").is_some_and(|v| !v.is_empty())
+}
+
 impl Color {
-    fn code(self, border: &'static str) -> &'static str {
+    fn code(self, border: &'static str, no_color: bool) -> &'static str {
+        if no_color {
+            return "";
+        }
+
         match self {
             Color::Reset => "\x1b[0m",
             Color::BoldRed => "\x1b[1;31m",
-            Color::Green => "\x1b[32m",
-            Color::Blue => "\x1b[34m",
             Color::BoldBlue => "\x1b[1;34m",
             Color::Yellow => "\x1b[33m",
             Color::Border => border,
@@ -83,8 +73,8 @@ impl Segment {
     }
 
     /// Render with ANSI colours, ending in the link.
-    fn render(&self, border: &'static str) -> String {
-        let color = self.color.code(border);
+    fn render(&self, border: &'static str, no_color: bool, reset: &'static str) -> String {
+        let color = self.color.code(border, no_color);
         let body = match self.frame.brackets() {
             Some((open, close)) => format!(
                 "{border}{open}{color}{content}{border}{close}",
@@ -92,14 +82,23 @@ impl Segment {
             ),
             None => format!("{color}{}", self.content),
         };
-        format!("{body}{border}{LINK}{RESET}")
+        format!("{body}{border}{LINK}{reset}")
     }
 }
 
-/// Working directory and how to render it.
-pub struct PathDisplay {
-    pub text: String,
-    pub color: Color,
+/// Everything needed to render one prompt.
+pub struct Prompt {
+    // Layout
+    pub cols: usize,
+    pub blank_lines: usize,
+
+    // Content
+    pub segments: Vec<Segment>,
+    pub is_root: bool,
+
+    // Path
+    pub path_text: String,
+    pub path_color: Color,
 }
 
 /// Clip `s` to `budget` columns from the front.
@@ -205,13 +204,29 @@ fn truncate_middle(path: &str, max: usize) -> String {
     format!("{ELLIPSIS}{}", clip_back(last, max - ell_width))
 }
 
-/// Render the prompt: segments flow across up to two content lines,
-/// the path trails the last one, and the final line is always `└─$`/`└─#`.
-pub fn render_prompt(cols: usize, segments: &[Segment], is_root: bool, path: &PathDisplay) {
-    let (border, user_color, sym) = if is_root {
-        (BORDER_ROOT, USER_ROOT, PROMPT_ROOT)
+/// Render the prompt to stdout.
+///
+/// Segments flow across up to two lines; the path trails the last
+/// line. If the segments don't fit, or there's no room for the path,
+/// fall back to a bare `$`/`#`.
+pub fn render_prompt(prompt: Prompt) {
+    let no_color = is_no_color();
+
+    let sym = if prompt.is_root { "#" } else { "$" };
+
+    // Color constants.
+    const RESET: &str = "\x1b[0m";
+    const BORDER_ROOT: &str = "\x1b[34m"; // Blue
+    const BORDER_USER: &str = "\x1b[32m"; // Green
+    const USER_ROOT: &str = "\x1b[1;31m"; // Red
+    const USER_NORMAL: &str = "\x1b[1;34m"; // Blue
+
+    let (border, user_color, reset) = if no_color {
+        ("", "", "")
+    } else if prompt.is_root {
+        (BORDER_ROOT, USER_ROOT, RESET)
     } else {
-        (BORDER_USER, USER_NORMAL, PROMPT_USER)
+        (BORDER_USER, USER_NORMAL, RESET)
     };
 
     // Same width (3 columns) for every prefix, so one budget serves both.
@@ -221,10 +236,14 @@ pub fn render_prompt(cols: usize, segments: &[Segment], is_root: bool, path: &Pa
     const P_LAST: &str = "└─";
     const PATH_WRAP: usize = 2; // "[" + "]"
 
-    let budget = cols.saturating_sub(UnicodeWidthStr::width(P_FIRST));
+    let budget = prompt.cols.saturating_sub(UnicodeWidthStr::width(P_FIRST));
 
-    let seg_renders: Vec<String> = segments.iter().map(|s| s.render(border)).collect();
-    let seg_w: Vec<usize> = segments.iter().map(|s| s.width()).collect();
+    let seg_renders: Vec<String> = prompt
+        .segments
+        .iter()
+        .map(|s| s.render(border, no_color, reset))
+        .collect();
+    let seg_w: Vec<usize> = prompt.segments.iter().map(|s| s.width()).collect();
 
     let mut line0 = String::new();
     let mut line1 = String::new();
@@ -248,36 +267,38 @@ pub fn render_prompt(cols: usize, segments: &[Segment], is_root: bool, path: &Pa
     }
 
     if split && !line0.is_empty() {
-        let dangling = format!("{border}{LINK}{RESET}");
+        let dangling = format!("{border}{LINK}{reset}");
         if let Some(rest) = line0.strip_suffix(&dangling) {
             line0.truncate(rest.len());
         }
     }
 
-    let (last_line, last_w) = if split {
-        (&mut line1, w1)
-    } else {
-        (&mut line0, w0)
-    };
-
-    if overflow {
-        last_line.push_str(&format!("{border}...{RESET}"));
-    } else {
-        let avail = budget.saturating_sub(last_w).saturating_sub(PATH_WRAP);
-        if avail > 0 {
-            let path_text = truncate_middle(&path.text, avail);
-            last_line.push_str(&format!(
-                "{border}[{color}{path_text}{border}]",
-                color = path.color.code(border),
-            ));
+    let last_w = if split { w1 } else { w0 };
+    let avail = budget.saturating_sub(last_w).saturating_sub(PATH_WRAP);
+    if overflow || (!prompt.path_text.is_empty() && avail == 0) {
+        for _ in 0..prompt.blank_lines {
+            println!();
         }
+        print!("{user_color}{sym}{reset} ");
+        return;
+    }
+
+    let last_line = if split { &mut line1 } else { &mut line0 };
+    if avail > 0 {
+        let path_text = truncate_middle(&prompt.path_text, avail);
+        last_line.push_str(&format!(
+            "{border}[{color}{path_text}{border}]",
+            color = prompt.path_color.code(border, no_color),
+        ));
     }
 
     let first = if split { P_FIRST_SPLIT } else { P_FIRST };
-    println!();
-    println!("{border}{first}{line0}{RESET}");
-    if split {
-        println!("{border}{P_SECOND}{line1}{RESET}");
+    for _ in 0..prompt.blank_lines {
+        println!();
     }
-    print!("{border}{P_LAST}{user_color}{sym}{RESET} ");
+    println!("{border}{first}{line0}{reset}");
+    if split {
+        println!("{border}{P_SECOND}{line1}{reset}");
+    }
+    print!("{border}{P_LAST}{user_color}{sym}{reset} ");
 }
