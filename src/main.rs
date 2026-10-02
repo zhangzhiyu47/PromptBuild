@@ -3,16 +3,24 @@ mod render;
 use argh::FromArgs;
 use nix::{
     sys::signal::Signal,
-    unistd::{Uid, User, geteuid, gethostname},
+    sys::stat::{Mode, umask},
+    unistd::{AccessFlags, Uid, User, access, geteuid, gethostname, getuid, setsid},
 };
 use render::{Color, Frame, Prompt, Segment, render_prompt};
-use std::collections::HashSet;
 use std::env;
 use std::ffi::OsString;
 use std::fmt::Write;
 use std::fs;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
+
+/// Set on the daemon child's environment by `spawn_self_as_daemon`.
+/// value = socket path to bind.
+const DAEMON_ENV: &str = "PROMPT_DAEMON_SOCKET";
+
+/// Optional log path override, read by the daemon at startup. Absent means
+/// "use the XDG state default". Set by the user before invoking prompt.
+const DAEMON_LOG_ENV: &str = "PROMPT_DAEMON_LOG";
 
 /// A collection of pipeline statuses.
 #[derive(Debug)]
@@ -164,64 +172,90 @@ struct Args {
     version: Option<bool>,
 }
 
-/// Resolve a `.git` entry into the repository's Git directory.
-fn resolve_git_dir(dot_git: &Path) -> Option<PathBuf> {
-    let mut seen: HashSet<(u64, u64)> = HashSet::new();
-    let mut cur = dot_git.to_path_buf();
-
-    loop {
-        let meta = fs::symlink_metadata(&cur).ok()?;
-        if !seen.insert((meta.dev(), meta.ino())) {
-            return None;
-        }
-
-        if meta.file_type().is_symlink() {
-            let target = fs::read_link(&cur).ok()?;
-            cur = if target.is_absolute() {
-                target
-            } else {
-                cur.parent()?.join(target)
-            };
-        } else if meta.is_dir() {
-            return cur.join("HEAD").is_file().then_some(cur);
-        } else if meta.is_file() {
-            let content = fs::read_to_string(&cur).ok()?;
-            let target = content
-                .lines()
-                .find_map(|line| line.strip_prefix("gitdir:"))
-                .map(str::trim)?;
-            cur = if Path::new(target).is_absolute() {
-                PathBuf::from(target)
-            } else {
-                cur.parent()?.join(target)
-            };
-        } else {
-            return None;
-        }
+/// Resolve the daemon's log file path.
+fn resolve_daemon_log() -> PathBuf {
+    if let Some(p) = env::var_os(DAEMON_LOG_ENV).filter(|v| !v.is_empty()) {
+        return PathBuf::from(p);
     }
+    let state_dir = env::var("XDG_STATE_HOME")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| {
+            let home = env::var("HOME").unwrap_or_default();
+            format!("{home}/.local/state")
+        });
+    PathBuf::from(state_dir)
+        .join("beachcomber")
+        .join("daemon.log")
 }
 
-/// Walk upwards from `start` until a Git directory is found.
-fn find_git_dir(start: &Path) -> Option<PathBuf> {
-    let mut dir = start;
-    loop {
-        if let Some(git_dir) = resolve_git_dir(&dir.join(".git")) {
-            return Some(git_dir);
-        }
-        dir = dir.parent()?;
+fn run_as_daemon(socket: PathBuf) -> ! {
+    let log_path = resolve_daemon_log();
+
+    // SAFETY: single-threaded at this point
+    // no other thread can be reading or writing the environment.
+    unsafe {
+        env::remove_var(DAEMON_ENV);
+        env::remove_var(DAEMON_LOG_ENV);
     }
+
+    // Detach from the controlling terminal.
+    let _ = setsid();
+
+    let _ = env::set_current_dir("/");
+
+    umask(Mode::from_bits_truncate(0o077));
+
+    let config = beachcomber::config::Config::load();
+    let code = beachcomber::cli::run_daemon(socket, log_path, config);
+    std::process::exit(if code == std::process::ExitCode::SUCCESS {
+        0
+    } else {
+        1
+    });
 }
 
-/// Read `HEAD` and format it for display.
-fn get_git_branch(physical_dir: &Path) -> Option<String> {
-    let git_dir = find_git_dir(physical_dir)?;
-    let head = fs::read_to_string(git_dir.join("HEAD")).ok()?;
-    let head = head.trim();
+/// Resolve the daemon socket path.
+fn resolve_daemon_socket() -> PathBuf {
+    const FILENAME: &str = "beachcomber.sock";
 
-    if let Some(branch) = head.strip_prefix("ref: refs/heads/") {
-        return Some(branch.to_string());
+    let uid = getuid().as_raw();
+
+    let mut candidates: Vec<PathBuf> = Vec::with_capacity(3);
+    candidates.push(PathBuf::from(format!("/var/run/user/{uid}")).join(FILENAME));
+    candidates.push(PathBuf::from("/data/data/com.termux/files/usr/var").join(FILENAME));
+    if let Some(xdg) = env::var_os("XDG_RUNTIME_DIR").filter(|v| !v.is_empty()) {
+        candidates.push(PathBuf::from(xdg).join(FILENAME));
     }
-    Some(String::from("detached"))
+
+    for candidate in &candidates {
+        let Some(parent) = candidate.parent() else {
+            continue;
+        };
+        if parent.is_dir() && access(parent, AccessFlags::W_OK).is_ok() {
+            return candidate.clone();
+        }
+    }
+
+    eprintln!(
+        "prompt: no writable runtime directory for the daemon socket; tried: {}",
+        candidates
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    std::process::exit(1);
+}
+
+fn spawn_self_as_daemon(socket: &Path) -> std::io::Result<()> {
+    std::process::Command::new(env::current_exe()?)
+        .env(DAEMON_ENV, socket)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()?;
+    Ok(())
 }
 
 /// Replace the home directory prefix with '~' if present.
@@ -282,6 +316,14 @@ fn same_node(a: &Path, b: &Path) -> bool {
     }
 }
 
+/// Whether the current user can write to `path`.
+///
+/// Uses `access(2)` so that real UID/GID, supplementary groups and
+/// root privileges are all taken into account correctly.
+fn is_writable(path: &Path) -> bool {
+    access(path, AccessFlags::W_OK).is_ok()
+}
+
 /// Read and validate the `PWD` environment variable.
 ///
 /// A valid `PWD` is an absolute path without `.` or `..` components.
@@ -330,6 +372,10 @@ fn resolve_working_dir() -> (PathBuf, PathBuf, bool) {
 // ==============================
 
 fn main() {
+    if let Some(socket) = env::var_os(DAEMON_ENV).filter(|v| !v.is_empty()) {
+        run_as_daemon(socket.into());
+    }
+
     let args: Args = argh::from_env();
 
     if args.version.is_some() {
@@ -380,10 +426,53 @@ fn main() {
         .to_string_lossy()
         .into_owned();
 
+    let socket_path = resolve_daemon_socket();
+
+    let client = libbeachcomber::Client::new()
+        .with_socket_path(socket_path)
+        .with_daemon_spawner(spawn_self_as_daemon);
+
+    let git_branch = match client.get("git.branch", Some(physical_path.to_string_lossy().as_ref()))
+    {
+        Ok(libbeachcomber::CombResult::Hit { data, .. }) => {
+            if data.get_str("git.branch").is_some_and(|s| s.is_empty()) {
+                Some("detached".to_string())
+            } else {
+                data.get_str("git.branch").map(String::from)
+            }
+        }
+        _ => None,
+    };
+
+    let git_status = match client.get("git.status", Some(physical_path.to_string_lossy().as_ref()))
+    {
+        Ok(libbeachcomber::CombResult::Hit { data, .. }) => {
+            let mut marks = String::new();
+            for (field, sym) in [
+                ("conflicted", '×'),
+                ("staged", '+'),
+                ("unstaged", '~'),
+                ("untracked", '?'),
+            ] {
+                let n = data.get_i64(field).unwrap_or(0);
+                if n > 0 {
+                    if !marks.is_empty() {
+                        marks.push('|');
+                    }
+                    marks.push(sym);
+                    marks.push_str(&n.to_string());
+                }
+            }
+            if marks.is_empty() { None } else { Some(marks) }
+        }
+        _ => None,
+    };
+
     let mut segments = Vec::new();
 
     let badges = [
-        get_git_branch(&physical_path),
+        git_branch,
+        git_status,
         env::var("debian_chroot").ok(),
         env::var("VIRTUAL_ENV").ok().and_then(|v| {
             Path::new(&v)
@@ -440,10 +529,12 @@ fn main() {
         segments,
         is_root,
         path_text: replace_home(&pwd, &home),
-        path_color: if cwd_valid {
-            Color::Reset
-        } else {
+        path_color: if !cwd_valid {
             Color::Yellow
+        } else if !is_writable(&physical_path) {
+            Color::Gray
+        } else {
+            Color::None
         },
         blank_lines: args.blank_lines.unwrap_or(1),
     };

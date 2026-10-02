@@ -3,11 +3,19 @@ name = "prompt"
 version = "0.1.0"
 edition = "2024"
 
+[workspace]
+members = [
+    "beachcomber",
+    "beachcomber/libbeachcomber",
+]
+
 [dependencies]
 unicode-width = "0.1"
 terminal_size = "0.4"
 argh = "0.1"
-nix = { version = "0.27", features = ["user", "signal", "hostname"] }
+nix = { version = "0.27", features = ["user", "signal", "hostname", "fs"] }
+beachcomber = { path = "beachcomber" }
+libbeachcomber = { path = "beachcomber/libbeachcomber" }
 
 [profile.release]
 opt-level = 3

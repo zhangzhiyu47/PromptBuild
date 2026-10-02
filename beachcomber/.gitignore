@@ -1,0 +1,46 @@
+/target
+/vendor
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# macOS
+.DS_Store
+
+# Claude Code working files
+.claude/
+
+# Git worktrees
+.worktrees/
+
+# Internal planning docs (kept in repo but not published)
+INIT.md
+docs/superpowers/
+.superpowers/
+
+# SDK build artifacts
+sdks/python/__pycache__/
+sdks/python/**/__pycache__/
+sdks/python/.venv/
+sdks/python/.pytest_cache/
+sdks/python/uv.lock
+sdks/python/dist/
+sdks/node/node_modules/
+sdks/node/dist/
+sdks/ruby/*.gem
+placeholders/ruby/*.gem
+placeholders/pypi/dist/
+placeholders/pypi/**/__pycache__/
+sdks/c/test_beachcomber*
+sdks/c/*.o
+sdks/c/*.a
+sdks/c/*.so
+sdks/c/*.dylib
+sdks/c/conformance_runner
+
+# Nix
+flake.lock

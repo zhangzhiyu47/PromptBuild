@@ -26,11 +26,11 @@ impl Frame {
 /// Content colour of a segment.
 #[derive(Clone, Copy)]
 pub enum Color {
-    Reset,
+    None,
     BoldRed,
     BoldBlue,
     Yellow,
-    /// Follow the border colour chosen by `render_prompt`.
+    Gray,
     Border,
 }
 
@@ -45,10 +45,11 @@ impl Color {
         }
 
         match self {
-            Color::Reset => "\x1b[0m",
+            Color::None => "\x1b[0m",
             Color::BoldRed => "\x1b[1;31m",
             Color::BoldBlue => "\x1b[1;34m",
             Color::Yellow => "\x1b[33m",
+            Color::Gray => "\x1b[90m",
             Color::Border => border,
         }
     }
