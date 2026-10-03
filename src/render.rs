@@ -31,6 +31,7 @@ pub enum Color {
     BoldBlue,
     Yellow,
     Gray,
+    Orange,
     Border,
 }
 
@@ -50,6 +51,7 @@ impl Color {
             Color::BoldBlue => "\x1b[1;34m",
             Color::Yellow => "\x1b[33m",
             Color::Gray => "\x1b[90m",
+            Color::Orange => "\x1b[38;5;214m",
             Color::Border => border,
         }
     }

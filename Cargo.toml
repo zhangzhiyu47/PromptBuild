@@ -3,19 +3,18 @@ name = "prompt"
 version = "0.1.0"
 edition = "2024"
 
-[workspace]
-members = [
-    "beachcomber",
-    "beachcomber/libbeachcomber",
-]
-
 [dependencies]
 unicode-width = "0.1"
 terminal_size = "0.4"
 argh = "0.1"
 nix = { version = "0.27", features = ["user", "signal", "hostname", "fs"] }
-beachcomber = { path = "beachcomber" }
-libbeachcomber = { path = "beachcomber/libbeachcomber" }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "macros", "io-util", "sync"] }
+moka = { version = "0.12", features = ["sync"] }
+notify = "6"
+notify-debouncer-mini = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
 
 [profile.release]
 opt-level = 3

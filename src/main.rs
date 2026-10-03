@@ -1,3 +1,7 @@
+mod beach;
+mod context;
+mod daemon;
+mod git;
 mod render;
 
 use argh::FromArgs;
@@ -12,6 +16,7 @@ use std::ffi::OsString;
 use std::fmt::Write;
 use std::fs;
 use std::os::unix::fs::MetadataExt;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 
 /// Set on the daemon child's environment by `spawn_self_as_daemon`.
@@ -190,8 +195,6 @@ fn resolve_daemon_log() -> PathBuf {
 }
 
 fn run_as_daemon(socket: PathBuf) -> ! {
-    let log_path = resolve_daemon_log();
-
     // SAFETY: single-threaded at this point
     // no other thread can be reading or writing the environment.
     unsafe {
@@ -206,13 +209,11 @@ fn run_as_daemon(socket: PathBuf) -> ! {
 
     umask(Mode::from_bits_truncate(0o077));
 
-    let config = beachcomber::config::Config::load();
-    let code = beachcomber::cli::run_daemon(socket, log_path, config);
-    std::process::exit(if code == std::process::ExitCode::SUCCESS {
-        0
-    } else {
-        1
-    });
+    let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+    if let Err(e) = rt.block_on(beach::daemon::run(socket, 300)) {
+        eprintln!("daemon error: {e}");
+    }
+    std::process::exit(0);
 }
 
 /// Resolve the daemon socket path.
@@ -250,6 +251,7 @@ fn resolve_daemon_socket() -> PathBuf {
 
 fn spawn_self_as_daemon(socket: &Path) -> std::io::Result<()> {
     std::process::Command::new(env::current_exe()?)
+        .arg0("promptd")
         .env(DAEMON_ENV, socket)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
@@ -428,64 +430,17 @@ fn main() {
 
     let socket_path = resolve_daemon_socket();
 
-    let client = libbeachcomber::Client::new()
-        .with_socket_path(socket_path)
-        .with_daemon_spawner(spawn_self_as_daemon);
-
-    let git_branch = match client.get("git.branch", Some(physical_path.to_string_lossy().as_ref()))
-    {
-        Ok(libbeachcomber::CombResult::Hit { data, .. }) => {
-            if data.get_str("git.branch").is_some_and(|s| s.is_empty()) {
-                Some("detached".to_string())
-            } else {
-                data.get_str("git.branch").map(String::from)
-            }
-        }
-        _ => None,
-    };
-
-    let git_status = match client.get("git.status", Some(physical_path.to_string_lossy().as_ref()))
-    {
-        Ok(libbeachcomber::CombResult::Hit { data, .. }) => {
-            let mut marks = String::new();
-            for (field, sym) in [
-                ("conflicted", '×'),
-                ("staged", '+'),
-                ("unstaged", '~'),
-                ("untracked", '?'),
-            ] {
-                let n = data.get_i64(field).unwrap_or(0);
-                if n > 0 {
-                    if !marks.is_empty() {
-                        marks.push('|');
-                    }
-                    marks.push(sym);
-                    marks.push_str(&n.to_string());
-                }
-            }
-            if marks.is_empty() { None } else { Some(marks) }
-        }
-        _ => None,
-    };
-
+    let mut daemon = daemon::DaemonConn::new(socket_path, spawn_self_as_daemon);
     let mut segments = Vec::new();
 
-    let badges = [
-        git_branch,
-        git_status,
-        env::var("debian_chroot").ok(),
-        env::var("VIRTUAL_ENV").ok().and_then(|v| {
-            Path::new(&v)
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-        }),
-        is_in_ssh.then(|| "ssh".to_string()),
-    ];
+    git::push_git_segments(&mut daemon, &physical_path, &mut segments);
 
-    for badge in badges.into_iter().flatten() {
+    context::push_context_segments(&mut segments);
+
+    if is_in_ssh {
         segments.push(Segment {
             frame: Frame::Paren,
-            content: badge,
+            content: "ssh".to_string(),
             color: Color::Border,
         });
     }
