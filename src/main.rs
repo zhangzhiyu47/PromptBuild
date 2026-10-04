@@ -1,6 +1,6 @@
 mod beach;
+mod config;
 mod context;
-mod daemon;
 mod git;
 mod render;
 
@@ -8,7 +8,7 @@ use argh::FromArgs;
 use nix::{
     sys::signal::Signal,
     sys::stat::{Mode, umask},
-    unistd::{AccessFlags, Uid, User, access, geteuid, gethostname, getuid, setsid},
+    unistd::{AccessFlags, Uid, User, access, geteuid, gethostname, setsid},
 };
 use render::{Color, Frame, Prompt, Segment, render_prompt};
 use std::env;
@@ -18,14 +18,6 @@ use std::fs;
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-
-/// Set on the daemon child's environment by `spawn_self_as_daemon`.
-/// value = socket path to bind.
-const DAEMON_ENV: &str = "PROMPT_DAEMON_SOCKET";
-
-/// Optional log path override, read by the daemon at startup. Absent means
-/// "use the XDG state default". Set by the user before invoking prompt.
-const DAEMON_LOG_ENV: &str = "PROMPT_DAEMON_LOG";
 
 /// A collection of pipeline statuses.
 #[derive(Debug)]
@@ -177,30 +169,36 @@ struct Args {
     version: Option<bool>,
 }
 
-/// Resolve the daemon's log file path.
-fn resolve_daemon_log() -> PathBuf {
-    if let Some(p) = env::var_os(DAEMON_LOG_ENV).filter(|v| !v.is_empty()) {
-        return PathBuf::from(p);
+/// Point `tracing` at the daemon log file. Failures fall back to stderr
+/// and never abort the daemon.
+fn init_logging(log_path: &Path) {
+    if let Some(parent) = log_path.parent() {
+        let _ = fs::create_dir_all(parent);
     }
-    let state_dir = env::var("XDG_STATE_HOME")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| {
-            let home = env::var("HOME").unwrap_or_default();
-            format!("{home}/.local/state")
-        });
-    PathBuf::from(state_dir)
-        .join("beachcomber")
-        .join("daemon.log")
+
+    match fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_path)
+    {
+        Ok(file) => {
+            let writer = std::sync::Mutex::new(file);
+            let _ = tracing_subscriber::fmt()
+                .with_writer(writer)
+                .with_ansi(false)
+                .with_target(false)
+                .with_level(true)
+                .with_max_level(tracing::Level::INFO)
+                .init();
+        }
+        Err(e) => {
+            eprintln!("promptd: cannot open log {}: {e}", log_path.display());
+        }
+    }
 }
 
 fn run_as_daemon(socket: PathBuf) -> ! {
-    // SAFETY: single-threaded at this point
-    // no other thread can be reading or writing the environment.
-    unsafe {
-        env::remove_var(DAEMON_ENV);
-        env::remove_var(DAEMON_LOG_ENV);
-    }
+    init_logging(&config::log_path());
 
     // Detach from the controlling terminal.
     let _ = setsid();
@@ -209,50 +207,25 @@ fn run_as_daemon(socket: PathBuf) -> ! {
 
     umask(Mode::from_bits_truncate(0o077));
 
-    let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
-    if let Err(e) = rt.block_on(beach::daemon::run(socket, 300)) {
-        eprintln!("daemon error: {e}");
-    }
-    std::process::exit(0);
-}
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime");
 
-/// Resolve the daemon socket path.
-fn resolve_daemon_socket() -> PathBuf {
-    const FILENAME: &str = "beachcomber.sock";
-
-    let uid = getuid().as_raw();
-
-    let mut candidates: Vec<PathBuf> = Vec::with_capacity(3);
-    candidates.push(PathBuf::from(format!("/var/run/user/{uid}")).join(FILENAME));
-    candidates.push(PathBuf::from("/data/data/com.termux/files/usr/var").join(FILENAME));
-    if let Some(xdg) = env::var_os("XDG_RUNTIME_DIR").filter(|v| !v.is_empty()) {
-        candidates.push(PathBuf::from(xdg).join(FILENAME));
-    }
-
-    for candidate in &candidates {
-        let Some(parent) = candidate.parent() else {
-            continue;
-        };
-        if parent.is_dir() && access(parent, AccessFlags::W_OK).is_ok() {
-            return candidate.clone();
+    let code = match rt.block_on(beach::daemon::run(socket)) {
+        Ok(()) => 0,
+        Err(e) => {
+            eprintln!("{}: {}", config::DAEMON_NAME, e);
+            1
         }
-    }
-
-    eprintln!(
-        "prompt: no writable runtime directory for the daemon socket; tried: {}",
-        candidates
-            .iter()
-            .map(|p| p.display().to_string())
-            .collect::<Vec<_>>()
-            .join(", ")
-    );
-    std::process::exit(1);
+    };
+    std::process::exit(code);
 }
 
 fn spawn_self_as_daemon(socket: &Path) -> std::io::Result<()> {
     std::process::Command::new(env::current_exe()?)
-        .arg0("promptd")
-        .env(DAEMON_ENV, socket)
+        .arg0(config::DAEMON_NAME)
+        .env(config::SOCKET_ENV, socket)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -374,14 +347,15 @@ fn resolve_working_dir() -> (PathBuf, PathBuf, bool) {
 // ==============================
 
 fn main() {
-    if let Some(socket) = env::var_os(DAEMON_ENV).filter(|v| !v.is_empty()) {
-        run_as_daemon(socket.into());
+    let socket = config::socket_path();
+    if config::is_daemon() {
+        run_as_daemon(socket);
     }
 
     let args: Args = argh::from_env();
 
     if args.version.is_some() {
-        println!("{} v{}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
+        println!("{} v{}", config::APP_NAME, config::VERSION);
         std::process::exit(0);
     }
 
@@ -428,9 +402,7 @@ fn main() {
         .to_string_lossy()
         .into_owned();
 
-    let socket_path = resolve_daemon_socket();
-
-    let mut daemon = daemon::DaemonConn::new(socket_path, spawn_self_as_daemon);
+    let mut daemon = beach::DaemonConn::new(socket, spawn_self_as_daemon);
     let mut segments = Vec::new();
 
     git::push_git_segments(&mut daemon, &physical_path, &mut segments);

@@ -3,17 +3,26 @@
 
 use super::cache::PromptCache;
 use super::git;
-use super::watcher::{RepoChanged, RepoWatcher};
+use super::watcher::RepoWatcher;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::{UnixListener, UnixStream};
-use tracing::{debug, info, warn};
+use std::time::Duration;
+use tokio::{
+    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+    net::{UnixListener, UnixStream},
+    signal::unix::{SignalKind, signal},
+    sync::mpsc,
+    time::{Instant, sleep},
+};
+use tracing::{debug, info};
 
-const TTI_SECS: u64 = 300;
-const DEBOUNCE_MS: u64 = 500;
+const TTI_SECS: u64 = 60;
+const TTL_SECS: u64 = 600;
+const IDLE_SECS: u64 = 300;
+const DEBOUNCE_MS: u64 = 100;
 
 #[derive(Debug, Deserialize)]
 #[serde(tag = "op", rename_all = "lowercase")]
@@ -36,29 +45,69 @@ struct Response {
 
 impl Response {
     fn ok(data: Value) -> Self {
-        Self { ok: true, data: Some(data), error: None }
+        Self {
+            ok: true,
+            data: Some(data),
+            error: None,
+        }
     }
     fn miss() -> Self {
-        Self { ok: true, data: None, error: None }
+        Self {
+            ok: true,
+            data: None,
+            error: None,
+        }
     }
     fn error(msg: impl Into<String>) -> Self {
-        Self { ok: false, data: None, error: Some(msg.into()) }
+        Self {
+            ok: false,
+            data: None,
+            error: Some(msg.into()),
+        }
     }
 }
 
-pub async fn run(socket_path: PathBuf, tti_secs: u64) -> std::io::Result<()> {
-    let _ = std::fs::remove_file(&socket_path);
-    let listener = UnixListener::bind(&socket_path)?;
+/// Bind the daemon socket. A live listener on the same path means
+/// another daemon owns it and we exit; a refused connection means a
+/// stale file from a SIGKILL'd daemon, which we clear and retry.
+async fn bind_socket(path: &Path) -> std::io::Result<UnixListener> {
+    match UnixListener::bind(path) {
+        Ok(listener) => Ok(listener),
+        Err(e) if e.kind() != ErrorKind::AddrInUse => Err(e),
+        Err(_) => {
+            if UnixStream::connect(path).await.is_ok() {
+                info!("another daemon is already listening on {path:?}");
+                std::process::exit(0);
+            }
+            info!("clearing stale socket at {path:?}");
+            std::fs::remove_file(path)?;
+            UnixListener::bind(path)
+        }
+    }
+}
+
+pub async fn run(socket_path: PathBuf) -> std::io::Result<()> {
+    let listener = bind_socket(&socket_path).await?;
     info!("listening on {socket_path:?}");
 
-    let cache = Arc::new(PromptCache::new(tti_secs));
+    let cache = Arc::new(PromptCache::new(TTI_SECS, TTL_SECS));
     let (mut watcher, mut events) = RepoWatcher::new(DEBOUNCE_MS)?;
-    let (register_tx, mut register_rx) = tokio::sync::mpsc::channel::<PathBuf>(64);
+    let (register_tx, mut register_rx) = mpsc::channel::<PathBuf>(64);
 
-    loop {
+    let mut sigterm = signal(SignalKind::terminate())?;
+    let mut sigint = signal(SignalKind::interrupt())?;
+
+    const IDLE: Duration = Duration::from_secs(IDLE_SECS);
+
+    let idle = sleep(IDLE);
+    tokio::pin!(idle);
+
+    let reason = loop {
         tokio::select! {
             // New connection
             Ok((stream, _)) = listener.accept() => {
+                idle.as_mut().reset(Instant::now() + IDLE);
+
                 let cache = cache.clone();
                 let reg = register_tx.clone();
                 tokio::spawn(async move {
@@ -70,7 +119,7 @@ pub async fn run(socket_path: PathBuf, tti_secs: u64) -> std::io::Result<()> {
 
             // File change → invalidate cache for that repo.
             Some(changed) = events.recv() => {
-                debug!("repo changed: {:?}", changed.repo_root);
+                info!("invalidating git cache for {}", changed.repo_root.display());
                 cache.invalidate_path("git", Some(&changed.repo_root));
             }
 
@@ -78,8 +127,20 @@ pub async fn run(socket_path: PathBuf, tti_secs: u64) -> std::io::Result<()> {
             Some(repo) = register_rx.recv() => {
                 watcher.watch_repo(&repo);
             }
+
+            _ = sigterm.recv() => break "SIGTERM",
+            _ = sigint.recv() => break "SIGINT",
+            _ = &mut idle => break "idle timeout",
         }
-    }
+    };
+
+    info!("shutting down: {reason}");
+
+    // Clean up socket file
+    drop(listener);
+    let _ = std::fs::remove_file(&socket_path);
+
+    Ok(())
 }
 
 async fn handle_conn(
@@ -141,13 +202,14 @@ async fn handle_get(
         return Response::ok(json);
     }
 
+    // Snapshot before computing. If the watcher fires mid-flight,
+    // this becomes stale and the write below is refused.
+    let snapshot = cache.snapshot();
+
     // Miss → execute in blocking pool.
     let repo = repo_root.clone();
     let source_owned = source.to_string();
-    let fields = match tokio::task::spawn_blocking(move || {
-        git::execute(&source_owned, &repo)
-    })
-    .await
+    let fields = match tokio::task::spawn_blocking(move || git::execute(&source_owned, &repo)).await
     {
         Ok(Some(f)) => f,
         _ => return Response::miss(),
@@ -157,8 +219,12 @@ async fn handle_get(
         return Response::miss();
     }
 
-    cache.put(provider, Some(&repo_root), source, fields.clone());
+    if !cache.put_if_fresh(provider, Some(&repo_root), source, fields.clone(), snapshot) {
+        debug!("generation changed mid-flight; refusing to cache stale {source}");
+    }
+
     // Register this repo for watching (idempotent on daemon side).
+    info!("registering watcher for {}", repo_root.display());
     let _ = register_tx.send(repo_root).await;
 
     Response::ok(serde_json::to_value(&fields).unwrap_or(Value::Null))

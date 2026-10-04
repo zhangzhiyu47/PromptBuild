@@ -6,4 +6,4 @@ pub mod daemon;
 pub mod git;
 pub mod watcher;
 
-pub use client::Session;
+pub use client::DaemonConn;

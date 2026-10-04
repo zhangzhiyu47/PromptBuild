@@ -1,4 +1,4 @@
-//! Git source execution. Each source returns a field map.
+//! Git source execution.
 
 use serde_json::Value;
 use std::collections::HashMap;
@@ -10,35 +10,63 @@ pub struct GitDirs {
     pub commondir: PathBuf,
 }
 
-/// Walk up from `start` to find a directory containing `.git`.
-pub fn find_repo_root(start: &Path) -> Option<PathBuf> {
-    let mut cur: Option<&Path> = Some(start);
-    while let Some(dir) = cur {
-        if dir.join(".git").exists() {
-            return Some(dir.to_path_buf());
-        }
-        cur = dir.parent();
-    }
-    None
+pub fn is_in_git_repo(path: &Path) -> bool {
+    find_repo_root(path).is_some_and(|root| resolve_git_dirs(&root).is_some())
 }
 
-fn resolve_git_dirs(repo_root: &Path) -> Option<GitDirs> {
-    let dot_git = repo_root.join(".git");
-    let meta = std::fs::metadata(&dot_git).ok()?;
-    if meta.is_dir() {
-        return Some(GitDirs {
-            gitdir: dot_git.clone(),
-            commondir: dot_git,
-        });
+/// Walk up from `start` to find the repo root — the directory that
+/// contains `.git` and whose `.git` resolves to a real git dir.
+pub fn find_repo_root(start: &Path) -> Option<PathBuf> {
+    let mut dir = start;
+
+    loop {
+        if dir.join(".git").exists() {
+            return Some(std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf()));
+        }
+        dir = dir.parent()?;
     }
-    let contents = std::fs::read_to_string(&dot_git).ok()?;
-    let rel = contents.lines().next()?.strip_prefix("gitdir:")?.trim();
-    let gitdir = resolve_against(repo_root, rel);
-    let commondir = match std::fs::read_to_string(gitdir.join("commondir")) {
-        Ok(s) => resolve_against(&gitdir, s.trim()),
-        Err(_) => gitdir.clone(),
+}
+
+/// Resolve `<repo_root>/.git` (dir or `gitdir:` file) into a git dir.
+/// Returns `None` if the target doesn't look like a real git dir.
+pub fn resolve_git_dirs(repo_root: &Path) -> Option<GitDirs> {
+    let dot_git = repo_root.join(".git");
+
+    let gitdir = match std::fs::metadata(&dot_git) {
+        Ok(m) if m.is_dir() => dot_git,
+        Ok(_) => {
+            let contents = std::fs::read_to_string(&dot_git).ok()?;
+            let rel = contents.lines().next()?.strip_prefix("gitdir:")?.trim();
+            if rel.is_empty() {
+                return None;
+            }
+            resolve_against(repo_root, rel)
+        }
+        Err(_) => return None,
     };
+
+    if !looks_like_git(&gitdir) {
+        return None;
+    }
+
+    let commondir = read_commondir(&gitdir).unwrap_or_else(|| gitdir.clone());
     Some(GitDirs { gitdir, commondir })
+}
+
+fn looks_like_git(dir: &Path) -> bool {
+    dir.join("HEAD").is_file()
+        && (dir.join("objects").is_dir()
+            || dir.join("refs").is_dir()
+            || dir.join("commondir").is_file())
+}
+
+fn read_commondir(gitdir: &Path) -> Option<PathBuf> {
+    let s = std::fs::read_to_string(gitdir.join("commondir")).ok()?;
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+    Some(resolve_against(gitdir, s))
 }
 
 fn resolve_against(base: &Path, raw: &str) -> PathBuf {
@@ -54,83 +82,58 @@ fn resolve_against(base: &Path, raw: &str) -> PathBuf {
 /// Execute a source by name. `None` for unknown source.
 pub fn execute(source: &str, repo_root: &Path) -> Option<HashMap<String, Value>> {
     match source {
-        "head" => Some(execute_head(repo_root)),
-        "refs" => Some(execute_refs(repo_root)),
-        "status" => Some(execute_status(repo_root)),
-        "diff" => Some(execute_diff(repo_root)),
+        "snapshot" => Some(execute_snapshot(repo_root)),
         _ => None,
     }
 }
 
-/// `head`: parse `<gitdir>/HEAD` directly. No subprocess.
-fn execute_head(repo_root: &Path) -> HashMap<String, Value> {
+/// One-shot snapshot of everything the prompt renders.
+///
+/// Forks `git status` exactly once and feeds both the refs and status
+/// fields from that single output, so all fields describe the same
+/// instant. Everything else is a plain file read.
+fn execute_snapshot(repo_root: &Path) -> HashMap<String, Value> {
     let mut out = HashMap::new();
-    let Some(dirs) = resolve_git_dirs(repo_root) else {
-        return out;
-    };
-    let Ok(contents) = std::fs::read_to_string(dirs.gitdir.join("HEAD")) else {
-        return out;
-    };
-    let line = contents.trim();
-    let (branch, detached) = if let Some(b) = line.strip_prefix("ref: refs/heads/") {
-        (b.to_string(), false)
-    } else if (line.len() == 40 || line.len() == 64)
-        && line.chars().all(|c| c.is_ascii_hexdigit())
-    {
-        (String::new(), true)
-    } else {
-        (String::new(), false)
-    };
-    out.insert("branch".into(), Value::String(branch));
-    out.insert("detached".into(), Value::Bool(detached));
-    out
-}
 
-/// `refs`: repo state + upstream divergence + stash count.
-fn execute_refs(repo_root: &Path) -> HashMap<String, Value> {
-    let mut out = HashMap::new();
-    let Some(s) = parse_git_status(repo_root) else {
-        return out;
-    };
-    let dirs = resolve_git_dirs(repo_root);
-    let stash = dirs.as_ref().map(count_stashes).unwrap_or(0);
-    let (state, step, total) = dirs
-        .as_ref()
-        .map(detect_repo_state)
-        .unwrap_or_else(|| ("clean".to_string(), 0, 0));
+    // Head + repo state: file reads, no subprocess.
+    if let Some(dirs) = resolve_git_dirs(repo_root) {
+        if let Ok(contents) = std::fs::read_to_string(dirs.gitdir.join("HEAD")) {
+            let line = contents.trim();
+            let (branch, detached) = if let Some(b) = line.strip_prefix("ref: refs/heads/") {
+                (b.to_string(), false)
+            } else if (line.len() == 40 || line.len() == 64)
+                && line.chars().all(|c| c.is_ascii_hexdigit())
+            {
+                (String::new(), true)
+            } else {
+                (String::new(), false)
+            };
+            out.insert("branch".into(), Value::String(branch));
+            out.insert("detached".into(), Value::Bool(detached));
+        }
 
-    out.insert("state".into(), Value::String(state));
-    out.insert("state_step".into(), Value::Number(step.into()));
-    out.insert("state_total".into(), Value::Number(total.into()));
-    out.insert("stash".into(), Value::Number(stash.into()));
-    out.insert("ahead".into(), Value::Number(s.ahead.into()));
-    out.insert("behind".into(), Value::Number(s.behind.into()));
-    out
-}
+        let (state, step, total) = detect_repo_state(&dirs);
+        out.insert("state".into(), Value::String(state));
+        out.insert("state_step".into(), Value::Number(step.into()));
+        out.insert("state_total".into(), Value::Number(total.into()));
 
-/// `status`: staged/unstaged/untracked/conflicted counts.
-fn execute_status(repo_root: &Path) -> HashMap<String, Value> {
-    let mut out = HashMap::new();
-    let Some(s) = parse_git_status(repo_root) else {
-        return out;
-    };
-    let dirty = s.staged > 0 || s.unstaged > 0 || s.untracked > 0 || s.conflicted > 0;
-    out.insert("staged".into(), Value::Number(s.staged.into()));
-    out.insert("unstaged".into(), Value::Number(s.unstaged.into()));
-    out.insert("untracked".into(), Value::Number(s.untracked.into()));
-    out.insert("conflicted".into(), Value::Number(s.conflicted.into()));
-    out.insert("dirty".into(), Value::Bool(dirty));
-    out
-}
+        let stash = count_stashes(&dirs);
+        out.insert("stash".into(), Value::Number(stash.into()));
+    }
 
-fn execute_diff(repo_root: &Path) -> HashMap<String, Value> {
-    let mut out = HashMap::new();
-    let (a, d) = diff_numstat(repo_root, false);
-    let (sa, sd) = diff_numstat(repo_root, true);
-    out.insert("lines_added".into(), Value::Number(a.into()));
-    out.insert("lines_removed".into(), Value::Number(d.into()));
-    out.insert("lines_staged_added".into(), Value::Number(sa.into()));
-    out.insert("lines_staged_removed".into(), Value::Number(sd.into()));
+    // Refs + status: one `git status` call serves both.
+    if let Some(s) = parse_git_status(repo_root) {
+        out.insert("ahead".into(), Value::Number(s.ahead.into()));
+        out.insert("behind".into(), Value::Number(s.behind.into()));
+
+        let dirty = s.staged > 0 || s.unstaged > 0 || s.untracked > 0 || s.conflicted > 0;
+        out.insert("staged".into(), Value::Number(s.staged.into()));
+        out.insert("unstaged".into(), Value::Number(s.unstaged.into()));
+        out.insert("untracked".into(), Value::Number(s.untracked.into()));
+        out.insert("conflicted".into(), Value::Number(s.conflicted.into()));
+        out.insert("dirty".into(), Value::Bool(dirty));
+    }
+
     out
 }
 
@@ -227,27 +230,6 @@ fn read_int(p: &Path) -> i64 {
         .ok()
         .and_then(|s| s.trim().parse().ok())
         .unwrap_or(0)
-}
-
-fn diff_numstat(repo_root: &Path, staged: bool) -> (i64, i64) {
-    let args: &[&str] = if staged {
-        &["diff", "--cached", "--numstat"]
-    } else {
-        &["diff", "--numstat"]
-    };
-    let Ok(out) = git(repo_root, args) else {
-        return (0, 0);
-    };
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    let (mut a, mut d) = (0i64, 0i64);
-    for line in stdout.lines() {
-        let parts: Vec<&str> = line.splitn(3, '\t').collect();
-        if parts.len() >= 2 {
-            a += parts[0].parse::<i64>().unwrap_or(0);
-            d += parts[1].parse::<i64>().unwrap_or(0);
-        }
-    }
-    (a, d)
 }
 
 fn git(dir: &Path, args: &[&str]) -> std::io::Result<std::process::Output> {
